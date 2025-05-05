@@ -9,9 +9,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 # Use the new recommended library 'google-genai'
 from google import genai
-# Import types for configuration like EmbedContentConfig
-from google.generativeai import types
-from google.generativeai.types import EmbedContentResponse # Keep for type hinting if needed
+
 from google.api_core import exceptions as google_exceptions
 
 # --- Constants ---
