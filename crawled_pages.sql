@@ -8,14 +8,15 @@ create table crawled_pages (
     chunk_number integer not null,
     content text not null,  -- Added content column
     metadata jsonb not null default '{}'::jsonb,  -- Added metadata column
-    embedding vector(1536),  -- OpenAI embeddings are 1536 dimensions
+    embedding vector(1536),  -- Gemini embeddings can be 1536 dimensions
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
-    
+
     -- Add a unique constraint to prevent duplicate chunks for the same URL
     unique(url, chunk_number)
 );
 
 -- Create an index for better vector similarity search performance
+-- Using cosine distance as it's common for semantic similarity
 create index on crawled_pages using ivfflat (embedding vector_cosine_ops);
 
 -- Create an index on metadata for faster filtering
@@ -47,9 +48,11 @@ begin
     chunk_number,
     content,
     metadata,
+    -- Calculate cosine similarity (1 - cosine distance)
     1 - (crawled_pages.embedding <=> query_embedding) as similarity
   from crawled_pages
   where metadata @> filter
+  -- Order by cosine distance (ascending, smaller is better)
   order by crawled_pages.embedding <=> query_embedding
   limit match_count;
 end;
