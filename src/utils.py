@@ -10,8 +10,6 @@ from dotenv import load_dotenv
 # Use the new recommended library 'google-genai'
 from google import genai
 
-from google.api_core import exceptions as google_exceptions
-
 # --- Constants ---
 # Use the experimental SOTA model by default as requested
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-exp-03-07"
