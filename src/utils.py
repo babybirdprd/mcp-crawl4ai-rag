@@ -18,6 +18,7 @@ from google.api_core import exceptions as google_exceptions
 # Use the experimental SOTA model by default as requested
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-exp-03-07"
 # Keep dimension consistent with DB schema (experimental model supports 768, 1536, 3072)
+# Supabase only supports 1536 dimensions for vector columns
 OUTPUT_DIMENSIONALITY = 1536
 DEFAULT_EMBEDDING_DIM = OUTPUT_DIMENSIONALITY # Fallback dimension
 MAX_GEMINI_BATCH_SIZE = 100 # Gemini API limit for embed_content batch size
