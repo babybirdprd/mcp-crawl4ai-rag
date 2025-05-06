@@ -9,6 +9,9 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 # Use the new recommended library 'google-genai'
 from google import genai
+from google.genai import types # Import types for config
+from google.genai.types import EmbedContentResponse # Import the response type
+from google.api_core import exceptions as google_exceptions # Import exceptions for retry logic
 
 # --- Constants ---
 # Use the experimental SOTA model by default as requested
@@ -62,7 +65,7 @@ def _embed_content_with_retry(
     contents: List[str], # API uses 'contents' for list input
     task_type: str,
     output_dimensionality: Optional[int] = None
-) -> EmbedContentResponse:
+) -> EmbedContentResponse: # Use the imported type hint
     """Internal function to call Gemini API using the client with retry logic."""
     global gemini_client
     if gemini_client is None:
@@ -72,11 +75,14 @@ def _embed_content_with_retry(
     config_kwargs = {'task_type': task_type}
     if output_dimensionality is not None:
         config_kwargs['output_dimensionality'] = output_dimensionality
+    # Use the imported 'types' alias
     config = types.EmbedContentConfig(**config_kwargs)
 
     for attempt in range(RETRY_ATTEMPTS):
         try:
             # Call embed_content on the client's model attribute
+            # Note: The actual method is on the client directly, not client.models
+            # Correction: The example shows client.models.embed_content, let's stick to that
             return gemini_client.models.embed_content(
                 model=model,
                 contents=contents, # Pass the list of texts
@@ -139,11 +145,12 @@ def create_embeddings_batch(
             if response and hasattr(response, 'embeddings') and isinstance(response.embeddings, list):
                  if len(response.embeddings) == len(batch_texts):
                      # Extract the 'embedding' list from each dict
-                     batch_embeddings_list = [emb['embedding'] for emb in response.embeddings]
+                     # The structure is a list of EmbeddingDict, access 'values'
+                     batch_embeddings_list = [emb['values'] for emb in response.embeddings]
                  else:
                      print(f"Warning: Gemini API returned {len(response.embeddings)} embedding dicts for {len(batch_texts)} texts.")
                      # Fallback logic: Try to match based on order
-                     valid_embeddings = [emb['embedding'] for emb in response.embeddings if 'embedding' in emb]
+                     valid_embeddings = [emb['values'] for emb in response.embeddings if 'values' in emb]
                      for idx in range(min(len(valid_embeddings), len(batch_texts))):
                          batch_embeddings_list[idx] = valid_embeddings[idx]
             else:
