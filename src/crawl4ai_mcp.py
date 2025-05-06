@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import re
+import traceback # Added for printing stack traces
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 # Make sure to import the async versions from utils
@@ -323,7 +324,6 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             }, indent=2)
     except Exception as e:
         print(f"  Unhandled exception in crawl_single_page: {e}")
-        import traceback
         traceback.print_exc() # Print stack trace for debugging
         return json.dumps({
             "success": False,
@@ -446,7 +446,6 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         }, indent=2)
     except Exception as e:
         print(f"  Unhandled exception in smart_crawl_url: {e}")
-        import traceback
         traceback.print_exc()
         return json.dumps({
             "success": False,
@@ -506,8 +505,11 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     results_all = []
     # Use a queue for breadth-first search
     queue = asyncio.Queue()
+    start_domain = urlparse(start_urls[0]).netloc # Get domain from first URL
     for url in start_urls:
-        await queue.put((normalize_url(url), 0)) # Add (url, depth)
+        norm_url = normalize_url(url)
+        if norm_url:
+            await queue.put((norm_url, 0)) # Add (url, depth)
 
     while not queue.empty():
         current_url, depth = await queue.get()
@@ -521,6 +523,13 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
              visited.add(current_url) # Mark as visited to avoid re-queueing
              queue.task_done()
              continue
+
+        # Ensure we stay on the same domain
+        if urlparse(current_url).netloc != start_domain:
+            # print(f"    Skipping off-domain link: {current_url}") # Can be noisy
+            visited.add(current_url)
+            queue.task_done()
+            continue
 
         print(f"    Crawling (Depth {depth}): {current_url}")
         visited.add(current_url)
@@ -538,12 +547,12 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
                 # Add internal links to the queue for the next level
                 for link in result.links.get("internal", []):
                     next_url = normalize_url(link.get("href"))
-                    if next_url and next_url not in visited:
-                        # Basic check to stay on the same domain (optional, adjust if needed)
-                        if urlparse(next_url).netloc == urlparse(start_urls[0]).netloc:
-                             await queue.put((next_url, depth + 1))
-                        # else:
-                        #     print(f"      Skipping off-domain link: {next_url}")
+                    # Check if valid, not visited, and on the same domain before adding
+                    if next_url and next_url not in visited and urlparse(next_url).netloc == start_domain:
+                         await queue.put((next_url, depth + 1))
+                    # else:
+                    #     if next_url and urlparse(next_url).netloc != start_domain:
+                    #         print(f"      Skipping off-domain link: {next_url}")
             else:
                  error_msg = result.error_message if hasattr(result, 'error_message') else "Unknown crawl error"
                  print(f"      Failed or no content. Error: {error_msg}")
@@ -567,9 +576,9 @@ def normalize_url(url):
         if clean_url.endswith('/'):
             clean_url = clean_url[:-1]
         return clean_url
-    except Exception:
+    except Exception as e:
         # Handle potential errors if url is not a valid string or format
-        print(f"      Error normalizing URL: {url}")
+        print(f"      Error normalizing URL: {url} - {e}")
         return None
 
 
@@ -598,9 +607,8 @@ async def get_available_sources(ctx: Context) -> str:
         # Limit the query to avoid fetching too much data if the table is huge
         result = supabase_client.from_('crawled_pages')\
             .select('metadata->source', count='exact')\
-            .limit(10000) # Adjust limit as needed
+            .limit(10000)\
             .execute()
-
         unique_sources = set()
         count = 0
 
@@ -618,9 +626,11 @@ async def get_available_sources(ctx: Context) -> str:
             count = getattr(result, 'count', len(unique_sources))
             # If count seems off (e.g., due to limit), use set length
             if count is None or (result.data and len(result.data) == 10000):
+                 # *** FIXED INDENTATION HERE ***
                  count = len(unique_sources)
 
         else:
+             # *** FIXED INDENTATION HERE ***
              print(f"  No data received from Supabase or error in response: {getattr(result, 'error', 'N/A')}")
 
 
@@ -634,7 +644,6 @@ async def get_available_sources(ctx: Context) -> str:
         }, indent=2)
     except Exception as e:
         print(f"  Error in get_available_sources: {e}")
-        import traceback
         traceback.print_exc()
         return json.dumps({
             "success": False,
@@ -697,7 +706,6 @@ async def perform_rag_query(ctx: Context, query: str, source: Optional[str] = No
         }, indent=2)
     except Exception as e:
         print(f"  Error in perform_rag_query: {e}")
-        import traceback
         traceback.print_exc()
         return json.dumps({
             "success": False,
@@ -730,5 +738,4 @@ if __name__ == "__main__":
         print("\nServer stopped by user.")
     except Exception as e:
         print(f"\nServer encountered critical error: {e}")
-        import traceback
         traceback.print_exc()
