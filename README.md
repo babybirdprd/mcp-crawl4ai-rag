@@ -51,7 +51,7 @@ The server provides four essential web crawling and search tools:
 - [Docker/Docker Desktop](https://www.docker.com/products/docker-desktop/) if running the MCP server as a container (recommended)
 - [Python 3.12+](https://www.python.org/downloads/) if running the MCP server directly through uv
 - [Supabase](https://supabase.com/) (database for RAG)
-- [Voyage AI API key](https://dash.voyageai.com/api-keys) (for generating embeddings using `voyage-code-3`)
+- [Voyage AI API key](https://dashboard.voyageai.com/api-keys) (for generating embeddings using `voyage-code-3`) **200 million free tokens!!**
 
 ## Installation
 
