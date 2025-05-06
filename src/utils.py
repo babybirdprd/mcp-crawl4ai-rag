@@ -1,47 +1,34 @@
 """
-Utility functions for the Crawl4AI MCP server, using Google Gemini for embeddings.
-Uses the recommended google-genai library and the experimental embedding model by default.
+Utility functions for the Crawl4AI MCP server.
 """
 import os
-import time
+import asyncio # Added for sleep
 from typing import List, Dict, Any, Optional
+import json
 from supabase import create_client, Client
-from dotenv import load_dotenv
-# Use the new recommended library 'google-genai'
-from google import genai
-from google.genai import types # Import types for config
-from google.genai.types import EmbedContentResponse # Import the response type
-from google.api_core import exceptions as google_exceptions # Import exceptions for retry logic
+from urllib.parse import urlparse
+import voyageai
 
-# --- Constants ---
-# Use the experimental SOTA model by default as requested
-GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-exp-03-07"
-# Keep dimension consistent with DB schema (experimental model supports 768, 1536, 3072)
-# Supabase only supports 1536 dimensions for vector columns
-OUTPUT_DIMENSIONALITY = 1536
-DEFAULT_EMBEDDING_DIM = OUTPUT_DIMENSIONALITY # Fallback dimension
-MAX_GEMINI_BATCH_SIZE = 100 # Gemini API limit for embed_content batch size
-RETRY_ATTEMPTS = 3
-RETRY_DELAY_SECONDS = 2
+# Initialize Voyage AI client
+# It will automatically pick up the VOYAGE_API_KEY environment variable
+try:
+    vo = voyageai.Client()
+    VOYAGE_EMBEDDING_MODEL = "voyage-code-3"
+    VOYAGE_EMBEDDING_DIMENSION = 1024 # Default for voyage-code-3
+    # Rate Limits (Free Tier)
+    VOYAGE_RPM_LIMIT = 3
+    VOYAGE_TPM_LIMIT = 10000
+    # Calculate delay needed between requests (in seconds)
+    REQUEST_DELAY = 60 / VOYAGE_RPM_LIMIT + 1 # Add 1s buffer
+except Exception as e:
+    print(f"Error initializing Voyage AI client: {e}. Ensure VOYAGE_API_KEY is set.")
+    vo = None
+    VOYAGE_EMBEDDING_MODEL = None
+    VOYAGE_EMBEDDING_DIMENSION = 1024 # Keep default dimension for fallback
+    REQUEST_DELAY = 21 # Fallback delay
 
-# --- Initialization ---
-
-# Load environment variables (useful if this module is used independently)
-load_dotenv()
-
-# Global Gemini client instance (using the new library's client approach)
-gemini_client: Optional[genai.Client] = None
-
-def initialize_gemini():
-    """Initializes the global Gemini client using google-genai."""
-    global gemini_client
-    if gemini_client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY must be set in environment variables")
-        # Configure the client instance
-        gemini_client = genai.Client(api_key=api_key)
-        print(f"Gemini client initialized with model: {GEMINI_EMBEDDING_MODEL}")
+# Define a smaller default batch size to respect token limits
+DEFAULT_EMBEDDING_BATCH_SIZE = 5
 
 def get_supabase_client() -> Client:
     """
@@ -58,206 +45,122 @@ def get_supabase_client() -> Client:
 
     return create_client(url, key)
 
-# --- Embedding Functions ---
-
-def _embed_content_with_retry(
-    model: str,
-    contents: List[str], # API uses 'contents' for list input
-    task_type: str,
-    output_dimensionality: Optional[int] = None
-) -> EmbedContentResponse: # Use the imported type hint
-    """Internal function to call Gemini API using the client with retry logic."""
-    global gemini_client
-    if gemini_client is None:
-        initialize_gemini() # Ensure client is initialized
-
-    # Prepare configuration using types.EmbedContentConfig
-    config_kwargs = {'task_type': task_type}
-    if output_dimensionality is not None:
-        config_kwargs['output_dimensionality'] = output_dimensionality
-    # Use the imported 'types' alias
-    config = types.EmbedContentConfig(**config_kwargs)
-
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            # Call embed_content on the client's model attribute
-            return gemini_client.models.embed_content(
-                model=model,
-                contents=contents, # Pass the list of texts
-                config=config      # Pass the config object
-            )
-
-        except (google_exceptions.ResourceExhausted, google_exceptions.ServiceUnavailable, google_exceptions.InternalServerError) as e:
-            print(f"Gemini API rate limit or server error (Attempt {attempt + 1}/{RETRY_ATTEMPTS}): {e}. Retrying in {RETRY_DELAY_SECONDS}s...")
-            if attempt < RETRY_ATTEMPTS - 1:
-                time.sleep(RETRY_DELAY_SECONDS)
-            else:
-                print("Max retry attempts reached. Raising error.")
-                raise # Re-raise the last exception after final attempt
-        except Exception as e:
-            print(f"Unexpected error calling Gemini API (Attempt {attempt + 1}/{RETRY_ATTEMPTS}): {e}")
-            # Depending on the error, you might want to retry or raise immediately
-            if attempt < RETRY_ATTEMPTS - 1:
-                 time.sleep(RETRY_DELAY_SECONDS)
-            else:
-                 raise # Re-raise after final attempt for unexpected errors too
-
-def create_embeddings_batch(
-    texts: List[str],
-    task_type: str = "RETRIEVAL_DOCUMENT",
-    batch_size: int = MAX_GEMINI_BATCH_SIZE
-) -> List[List[float]]:
+# Note: create_embeddings_batch itself remains synchronous as vo.embed is sync
+# The rate limiting (delay) is handled by the caller (add_documents_to_supabase)
+def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
-    Create embeddings for multiple texts using Gemini, handling batching and retries.
+    Create embeddings for multiple texts in a single API call using Voyage AI.
+    WARNING: This function does NOT handle rate limiting itself. The caller must implement delays.
 
     Args:
-        texts: List of texts to create embeddings for.
-        task_type: The task type for the embedding model (e.g., "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY").
-        batch_size: How many texts to process in each API call.
+        texts: List of texts to create embeddings for (should respect batch size limits)
 
     Returns:
-        List of embeddings (each embedding is a list of floats). Returns empty lists
-        of the correct dimension for texts that failed embedding after retries.
+        List of embeddings (each embedding is a list of floats)
     """
     if not texts:
+        print("No texts provided to create_embeddings_batch.")
         return []
+    if not vo or not VOYAGE_EMBEDDING_MODEL:
+        print("Voyage AI client not initialized. Returning zero vectors.")
+        return [[0.0] * VOYAGE_EMBEDDING_DIMENSION for _ in range(len(texts))]
 
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        # Pre-fill with error embeddings matching the target dimensionality
-        batch_embeddings_list = [[0.0] * OUTPUT_DIMENSIONALITY] * len(batch_texts)
+    # Estimate token count (very rough estimate: ~4 chars/token)
+    # total_chars = sum(len(t) for t in texts)
+    # estimated_tokens = total_chars / 4
+    # print(f"Estimating {estimated_tokens} tokens for {len(texts)} texts.")
+    # if estimated_tokens > VOYAGE_TPM_LIMIT:
+    #     print(f"Warning: Estimated tokens ({estimated_tokens}) might exceed TPM limit ({VOYAGE_TPM_LIMIT}) for a single request if called too frequently.")
 
-        try:
-            # Ensure Gemini client is ready (initialization check is inside _embed_content_with_retry)
-            print(f"Requesting Gemini embeddings for batch {i//batch_size + 1} (size {len(batch_texts)}), task: {task_type}, model: {GEMINI_EMBEDDING_MODEL}, dim: {OUTPUT_DIMENSIONALITY}")
-            response = _embed_content_with_retry(
-                model=GEMINI_EMBEDDING_MODEL,
-                contents=batch_texts, # Use 'contents' for the list
-                task_type=task_type,
-                output_dimensionality=OUTPUT_DIMENSIONALITY
-            )
+    try:
+        # Using input_type=None as we are embedding chunks directly
+        result = vo.embed(
+            texts=texts,
+            model=VOYAGE_EMBEDDING_MODEL,
+            input_type=None, # Or "document" if specifically embedding docs for retrieval
+            truncation=True # Truncate long texts
+        )
+        # print(f"Voyage AI API call successful. Tokens used: {result.total_tokens}") # Voyage client doesn't return total_tokens directly in v0.6.0 result object
+        return result.embeddings
+    except Exception as e:
+        print(f"Error creating batch embeddings with Voyage AI: {e}")
+        # Return zero vectors if there's an error
+        return [[0.0] * VOYAGE_EMBEDDING_DIMENSION for _ in range(len(texts))]
 
-            # Process the response
-            # Check if response and response.embeddings exist and is a list
-            if response and hasattr(response, 'embeddings') and isinstance(response.embeddings, list):
-                 if len(response.embeddings) == len(batch_texts):
-                     # *** CORRECTED LINE ***
-                     # Access the 'values' attribute of each ContentEmbedding object
-                     batch_embeddings_list = [emb.values for emb in response.embeddings]
-                 else:
-                     print(f"Warning: Gemini API returned {len(response.embeddings)} embeddings for {len(batch_texts)} texts.")
-                     # Fallback logic: Try to match based on order
-                     # *** CORRECTED LINE ***
-                     # Use attribute access and check existence with hasattr
-                     valid_embeddings = [emb.values for emb in response.embeddings if hasattr(emb, 'values')]
-                     for idx in range(min(len(valid_embeddings), len(batch_texts))):
-                         batch_embeddings_list[idx] = valid_embeddings[idx]
-            else:
-                # Handle cases where response.embeddings might be missing or not a list
-                error_detail = f"Response type: {type(response)}, Embeddings type: {type(response.embeddings) if hasattr(response, 'embeddings') else 'N/A'}"
-                print(f"Warning: Gemini API returned unexpected structure for batch starting at index {i}. {error_detail}. Response: {response}")
-
-
-        except Exception as e:
-            # Catch the specific error if possible, otherwise general Exception
-            print(f"Error creating batch embeddings (batch starting index {i}): {type(e).__name__}: {e}. Using default embeddings for this batch.")
-            # batch_embeddings_list remains filled with default error embeddings
-
-        all_embeddings.extend(batch_embeddings_list)
-        print(f"Processed batch {i//batch_size + 1}. Total embeddings generated: {len(all_embeddings)}")
-        # Optional: Add a small delay between batches to help with rate limits
-        if len(texts) > batch_size and i + batch_size < len(texts):
-             time.sleep(0.5) # 500ms delay
-
-    # Final check: Ensure the number of embeddings matches the number of input texts
-    if len(all_embeddings) != len(texts):
-        print(f"Error: Mismatch between input texts ({len(texts)}) and generated embeddings ({len(all_embeddings)}). Padding/Truncating.")
-        # Pad with default embeddings if necessary
-        while len(all_embeddings) < len(texts):
-            all_embeddings.append([0.0] * OUTPUT_DIMENSIONALITY)
-        # Truncate if too many
-        all_embeddings = all_embeddings[:len(texts)]
-
-    return all_embeddings
-
-
-def create_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> List[float]:
+# Needs to be async because it calls the async create_embeddings_batch
+async def create_embedding(text: str) -> List[float]:
     """
-    Create an embedding for a single text using Gemini.
+    Create an embedding for a single text using Voyage AI's API.
+    Handles rate limiting implicitly via create_embeddings_batch caller if needed,
+    but a single call is unlikely to trigger limits.
 
     Args:
-        text: Text to create an embedding for.
-        task_type: The task type for the embedding model.
+        text: Text to create an embedding for
 
     Returns:
-        List of floats representing the embedding, or a default zero vector on error.
+        List of floats representing the embedding
     """
+    # A single embedding call is less likely to hit rate limits,
+    # but uses the batch function for consistency.
+    # No explicit sleep here, assuming single calls are infrequent.
     try:
-        # Batch size of 1 is handled by create_embeddings_batch
-        embeddings = create_embeddings_batch([text], task_type=task_type, batch_size=1)
-        # Add a check here to ensure embeddings list is not empty before accessing index 0
-        if embeddings and len(embeddings) > 0:
-            return embeddings[0]
-        else:
-            print(f"Error: create_embeddings_batch returned empty list for single text embedding.")
-            return [0.0] * OUTPUT_DIMENSIONALITY
+        # Pass as a list to the batch function
+        embeddings = create_embeddings_batch([text])
+        return embeddings[0] if embeddings else [0.0] * VOYAGE_EMBEDDING_DIMENSION
     except Exception as e:
-        print(f"Error creating single embedding: {e}")
-        return [0.0] * OUTPUT_DIMENSIONALITY
+        print(f"Error creating single embedding with Voyage AI: {e}")
+        # Return zero vector if there's an error
+        return [0.0] * VOYAGE_EMBEDDING_DIMENSION
 
-# --- Supabase Functions ---
-
-def add_documents_to_supabase(
+# Make async to allow for asyncio.sleep
+async def add_documents_to_supabase(
     client: Client,
     urls: List[str],
     chunk_numbers: List[int],
     contents: List[str],
     metadatas: List[Dict[str, Any]],
-    batch_size: int = 50 # Match embedding batch size or make independent
+    batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE # Use smaller default
 ) -> None:
     """
-    Add documents to the Supabase crawled_pages table in batches.
-    Generates Gemini embeddings for the content before insertion.
+    Add documents to the Supabase crawled_pages table in batches, respecting rate limits.
     Deletes existing records with the same URLs before inserting to prevent duplicates.
 
     Args:
-        client: Supabase client.
-        urls: List of URLs.
-        chunk_numbers: List of chunk numbers.
-        contents: List of document contents.
-        metadatas: List of document metadata.
-        batch_size: Size of each batch for embedding and insertion.
+        client: Supabase client
+        urls: List of URLs
+        chunk_numbers: List of chunk numbers
+        contents: List of document contents
+        metadatas: List of document metadata
+        batch_size: Size of each batch for embedding and insertion (should be small, e.g., 5)
     """
-    if not contents:
-        print("No documents provided to add_documents_to_supabase.")
-        return
+    if batch_size > DEFAULT_EMBEDDING_BATCH_SIZE:
+        print(f"Warning: Provided batch_size ({batch_size}) is larger than recommended ({DEFAULT_EMBEDDING_BATCH_SIZE}) for Voyage AI free tier. Adjusting to {DEFAULT_EMBEDDING_BATCH_SIZE}.")
+        batch_size = DEFAULT_EMBEDDING_BATCH_SIZE
 
-    # --- 1. Delete existing records for the affected URLs ---
-    unique_urls = sorted(list(set(urls)))
-    print(f"Deleting existing records for {len(unique_urls)} unique URLs...")
-    delete_batch_size = 500 # Supabase might handle larger deletes efficiently
-    deleted_count = 0
-    try:
-        for i in range(0, len(unique_urls), delete_batch_size):
-            batch_urls = unique_urls[i:i + delete_batch_size]
-            delete_result = client.table("crawled_pages").delete().in_("url", batch_urls).execute()
-            # Note: Supabase delete response might not give a precise count easily.
-            # We assume success if no exception is raised.
-            deleted_count += len(batch_urls) # Approximate count
-            print(f"Attempted deletion for batch {i//delete_batch_size + 1} (size {len(batch_urls)}).")
-        print(f"Deletion phase complete for ~{deleted_count} URLs.")
-    except Exception as e:
-        print(f"Error during batch deletion: {e}. Insertion might result in duplicates or conflicts.")
-        # Decide whether to proceed or raise the error
-        # raise e # Option: Stop execution if deletion fails critically
+    # Get unique URLs to delete existing records
+    unique_urls = list(set(urls))
 
-    # --- 2. Process and Insert new data in batches ---
-    print(f"Processing and inserting {len(contents)} chunks in batches of {batch_size}...")
-    inserted_count = 0
-    for i in range(0, len(contents), batch_size):
-        batch_end = min(i + batch_size, len(contents))
-        print(f"Processing batch {i//batch_size + 1}/{ (len(contents) + batch_size - 1)//batch_size } (indices {i}-{batch_end-1})")
+    # Delete existing records for these URLs first (single operation)
+    if unique_urls:
+        try:
+            print(f"Deleting existing records for {len(unique_urls)} URLs...")
+            client.table("crawled_pages").delete().in_("url", unique_urls).execute()
+            print("Deletion complete.")
+        except Exception as e:
+            print(f"Error during bulk delete: {e}. Records might not be deleted.")
+            # Decide if you want to proceed or raise an error
+            # For now, we'll print the error and continue insertion
+
+    total_docs = len(contents)
+    print(f"Starting insertion of {total_docs} chunks in batches of {batch_size}...")
+
+    # Process in batches to avoid memory issues and API rate limits
+    for i in range(0, total_docs, batch_size):
+        batch_end = min(i + batch_size, total_docs)
+        current_batch_num = (i // batch_size) + 1
+        total_batches = (total_docs + batch_size - 1) // batch_size
+
+        print(f"Processing batch {current_batch_num}/{total_batches} (indices {i} to {batch_end-1})...")
 
         # Get batch slices
         batch_urls = urls[i:batch_end]
@@ -265,150 +168,97 @@ def add_documents_to_supabase(
         batch_contents = contents[i:batch_end]
         batch_metadatas = metadatas[i:batch_end]
 
-        # Create embeddings for the batch
-        # Use RETRIEVAL_DOCUMENT task type for storing content
-        batch_embeddings = create_embeddings_batch(batch_contents, task_type="RETRIEVAL_DOCUMENT", batch_size=batch_size)
+        # --- Rate Limiting Point ---
+        # Create embeddings for the entire batch at once (API Call)
+        print(f"  Creating embeddings for {len(batch_contents)} chunks...")
+        batch_embeddings = create_embeddings_batch(batch_contents)
+        print(f"  Embeddings created.")
 
-        # Check if embedding generation was successful for the batch
-        if not batch_embeddings or len(batch_embeddings) != len(batch_contents):
-             print(f"Error: Embedding generation failed or returned incorrect count for batch {i}. Skipping insertion for this batch.")
+        if len(batch_embeddings) != len(batch_contents):
+             print(f"  Error: Mismatch between number of contents ({len(batch_contents)}) and embeddings ({len(batch_embeddings)}). Skipping batch.")
+             # Add delay even if skipping insert, as API call was made
+             print(f"  Waiting for {REQUEST_DELAY:.1f} seconds due to rate limit...")
+             await asyncio.sleep(REQUEST_DELAY)
              continue # Skip to the next batch
 
         batch_data = []
         for j in range(len(batch_contents)):
-            # Check if the specific embedding for this chunk is valid (not all zeros)
-            # This check prevents inserting rows if embedding failed for that specific text
-            if not batch_embeddings[j] or all(v == 0.0 for v in batch_embeddings[j]):
-                print(f"Warning: Skipping chunk {j} in batch {i} (URL: {batch_urls[j]}, Chunk: {batch_chunk_numbers[j]}) due to failed embedding (all zeros).")
-                continue # Skip this specific chunk
+            # Extract metadata fields
+            chunk_size = len(batch_contents[j])
 
             # Prepare data for insertion
-            # Ensure metadata is serializable JSON
-            current_metadata = batch_metadatas[j]
-            try:
-                # Add chunk size to metadata
-                current_metadata["chunk_size"] = len(batch_contents[j])
-                # You might want to add other auto-generated metadata here
-            except Exception as meta_e:
-                print(f"Warning: Could not process metadata for chunk {j} in batch {i}: {meta_e}")
-                current_metadata = {"error": "metadata processing failed", **current_metadata}
-
-
             data = {
                 "url": batch_urls[j],
                 "chunk_number": batch_chunk_numbers[j],
                 "content": batch_contents[j],
-                "metadata": current_metadata, # Already includes chunk_size
-                "embedding": batch_embeddings[j]
+                "metadata": {
+                    "chunk_size": chunk_size,
+                    **batch_metadatas[j]
+                },
+                "embedding": batch_embeddings[j] # Use the generated embedding
             }
             batch_data.append(data)
 
         # Insert batch into Supabase
         try:
-            if batch_data: # Ensure there's data to insert
-                insert_result = client.table("crawled_pages").insert(batch_data).execute()
-                # Basic check: Supabase insert result often has 'data' list
-                if hasattr(insert_result, 'data') and isinstance(insert_result.data, list):
-                     inserted_count += len(insert_result.data)
-                     print(f"Successfully inserted batch {i//batch_size + 1}. Total inserted so far: {inserted_count}")
-                else:
-                     # Fallback count if response format is unexpected
-                     inserted_count += len(batch_data)
-                     print(f"Inserted batch {i//batch_size + 1} (response format unclear). Total inserted approx: {inserted_count}")
-
-            else:
-                 print(f"Skipping insertion for batch {i//batch_size + 1} as no valid data was prepared (likely due to embedding errors).")
-
+            print(f"  Inserting {len(batch_data)} records into Supabase...")
+            client.table("crawled_pages").insert(batch_data).execute()
+            print(f"  Batch {current_batch_num}/{total_batches} inserted successfully.")
         except Exception as e:
-            print(f"Error inserting batch {i//batch_size + 1} into Supabase: {e}")
-            # Option: Implement per-row insertion fallback or logging failed rows
+            print(f"  Error inserting batch {current_batch_num} into Supabase: {e}")
+            # Decide how to handle insert errors (e.g., log, retry, skip)
 
-    print(f"Finished adding documents. Total chunks processed: {len(contents)}, Total chunks inserted: {inserted_count}")
+        # --- Rate Limiting Point ---
+        # Wait *after* processing the batch (embedding + insert) before starting the next
+        # Only sleep if there are more batches to process
+        if batch_end < total_docs:
+            print(f"  Waiting for {REQUEST_DELAY:.1f} seconds due to rate limit...")
+            await asyncio.sleep(REQUEST_DELAY)
+
+    print("All batches processed.")
 
 
-def search_documents(
+# Make async because it calls async create_embedding
+async def search_documents(
     client: Client,
     query: str,
     match_count: int = 10,
     filter_metadata: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for documents in Supabase using vector similarity with Gemini embeddings.
+    Search for documents in Supabase using vector similarity.
 
     Args:
-        client: Supabase client.
-        query: Query text.
-        match_count: Maximum number of results to return.
-        filter_metadata: Optional metadata filter (e.g., {"source": "example.com"}).
+        client: Supabase client
+        query: Query text
+        match_count: Maximum number of results to return
+        filter_metadata: Optional metadata filter
 
     Returns:
-        List of matching documents, or empty list on error.
+        List of matching documents
     """
+    # Create embedding for the query
+    # A single query embed is unlikely to hit limits, uses the async version
+    print(f"Creating embedding for query: '{query[:50]}...'")
+    query_embedding = await create_embedding(query)
+    print("Query embedding created.")
+
+    # Execute the search using the match_crawled_pages function
     try:
-        # Create embedding for the query using the appropriate task type
-        print(f"Creating Gemini embedding for query (task: RETRIEVAL_QUERY, model: {GEMINI_EMBEDDING_MODEL}): '{query[:100]}...'")
-        query_embedding = create_embedding(query, task_type="RETRIEVAL_QUERY")
-
-        # Check if the embedding failed (returned all zeros)
-        if not query_embedding or all(v == 0.0 for v in query_embedding):
-             print("Error: Failed to generate embedding for the query (resulted in zero vector).")
-             return []
-
-        # Prepare parameters for the RPC call
+        print(f"Searching Supabase (match_count={match_count}, filter={filter_metadata})...")
+        # Only include filter parameter if filter_metadata is provided and not empty
         params = {
             'query_embedding': query_embedding,
-            'match_count': match_count,
-            'filter': filter_metadata if filter_metadata else {} # Pass empty dict if no filter
+            'match_count': match_count
         }
 
-        print(f"Executing Supabase RPC 'match_crawled_pages' with match_count={match_count}, filter={params['filter']}")
+        # Only add the filter if it's actually provided and not empty
+        if filter_metadata:
+            params['filter'] = filter_metadata  # Pass the dictionary directly
+
         result = client.rpc('match_crawled_pages', params).execute()
-
-        if result.data:
-            print(f"Found {len(result.data)} potential matches.")
-            return result.data
-        else:
-            # Handle cases where the RPC call itself might have issues (check result status/error if available)
-            print("No documents found matching the query criteria.")
-            return []
-
+        print(f"Search complete. Found {len(result.data)} results.")
+        return result.data
     except Exception as e:
-        print(f"Error searching documents for query '{query}': {e}")
-        import traceback
-        traceback.print_exc() # Print stack trace for debugging RPC errors
+        print(f"Error searching documents: {e}")
         return []
-
-# --- Main guard ---
-if __name__ == "__main__":
-    # Example usage (optional, for testing)
-    print("Utils module loaded. Testing functions...")
-    try:
-        initialize_gemini()
-        print("Gemini client initialized.")
-
-        # Test embedding
-        # test_text = "This is a test sentence for Gemini experimental embeddings."
-        # embedding = create_embedding(test_text, task_type="SEMANTIC_SIMILARITY")
-        # if embedding and embedding != [0.0] * OUTPUT_DIMENSIONALITY:
-        #     print(f"Successfully created embedding for test text (first 5 dims): {embedding[:5]}...")
-        #     print(f"Embedding dimension: {len(embedding)}")
-        # else:
-        #     print("Failed to create test embedding.")
-
-        # Test Supabase connection (requires .env)
-        # try:
-        #     sb_client = get_supabase_client()
-        #     print("Supabase client created.")
-        #     # Example search (replace with a real query if data exists)
-        #     # search_results = search_documents(sb_client, "example query", match_count=2)
-        #     # print(f"Example search results: {search_results}")
-        # except ValueError as ve:
-        #      print(f"Supabase connection test failed: {ve}")
-        # except Exception as sb_e:
-        #      print(f"Error during Supabase test: {sb_e}")
-
-
-    except ValueError as ve:
-        print(f"Initialization failed: {ve}")
-    except Exception as e:
-        print(f"An unexpected error occurred during testing: {e}")

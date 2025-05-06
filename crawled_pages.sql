@@ -8,7 +8,7 @@ create table crawled_pages (
     chunk_number integer not null,
     content text not null,  -- Added content column
     metadata jsonb not null default '{}'::jsonb,  -- Added metadata column
-    embedding vector(1536),  -- Gemini embeddings can be 1536 dimensions
+    embedding vector(1024),  -- Changed dimension from 1536 to 1024 for voyage-code-3
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
 
     -- Add a unique constraint to prevent duplicate chunks for the same URL
@@ -16,7 +16,7 @@ create table crawled_pages (
 );
 
 -- Create an index for better vector similarity search performance
--- Using cosine distance as it's common for semantic similarity
+-- Note: Consider recreating the index if you change embedding dimensions on existing data
 create index on crawled_pages using ivfflat (embedding vector_cosine_ops);
 
 -- Create an index on metadata for faster filtering
@@ -26,7 +26,7 @@ CREATE INDEX idx_crawled_pages_source ON crawled_pages ((metadata->>'source'));
 
 -- Create a function to search for documentation chunks
 create or replace function match_crawled_pages (
-  query_embedding vector(1536),
+  query_embedding vector(1024), -- Changed dimension from 1536 to 1024
   match_count int default 10,
   filter jsonb DEFAULT '{}'::jsonb
 ) returns table (
@@ -48,11 +48,9 @@ begin
     chunk_number,
     content,
     metadata,
-    -- Calculate cosine similarity (1 - cosine distance)
     1 - (crawled_pages.embedding <=> query_embedding) as similarity
   from crawled_pages
   where metadata @> filter
-  -- Order by cosine distance (ascending, smaller is better)
   order by crawled_pages.embedding <=> query_embedding
   limit match_count;
 end;

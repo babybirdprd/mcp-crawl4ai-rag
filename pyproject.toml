@@ -1,14 +1,13 @@
 [project]
 name = "crawl4ai-mcp"
-version = "0.1.4" # Incremented version for dependency fix
-description = "MCP server for integrating web crawling and RAG into AI agents and AI coding assistants using Gemini Experimental Embeddings (1536 Dimensions)"
+version = "0.1.0"
+description = "MCP server for integrating web crawling and RAG into AI agents and AI coding assistants using Voyage AI embeddings"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "crawl4ai==0.6.2",
     "mcp==1.7.1",
     "supabase==2.15.1",
-    "google-genai==1.13.0",
-    "google-api-core", # Added explicit dependency for exception handling
-    "python-dotenv==1.0.1"
+    "voyageai==0.3.2",
+    "dotenv==0.9.9"
 ]
