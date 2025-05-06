@@ -81,8 +81,6 @@ def _embed_content_with_retry(
     for attempt in range(RETRY_ATTEMPTS):
         try:
             # Call embed_content on the client's model attribute
-            # Note: The actual method is on the client directly, not client.models
-            # Correction: The example shows client.models.embed_content, let's stick to that
             return gemini_client.models.embed_content(
                 model=model,
                 contents=contents, # Pass the list of texts
@@ -140,25 +138,30 @@ def create_embeddings_batch(
                 output_dimensionality=OUTPUT_DIMENSIONALITY
             )
 
-            # Process the response (structure might be slightly different with client)
-            # The client response structure usually has an 'embeddings' attribute which is a list of dicts {'embedding': [floats]}
+            # Process the response
+            # Check if response and response.embeddings exist and is a list
             if response and hasattr(response, 'embeddings') and isinstance(response.embeddings, list):
                  if len(response.embeddings) == len(batch_texts):
-                     # Extract the 'embedding' list from each dict
-                     # The structure is a list of EmbeddingDict, access 'values'
-                     batch_embeddings_list = [emb['values'] for emb in response.embeddings]
+                     # *** CORRECTED LINE ***
+                     # Access the 'values' attribute of each ContentEmbedding object
+                     batch_embeddings_list = [emb.values for emb in response.embeddings]
                  else:
-                     print(f"Warning: Gemini API returned {len(response.embeddings)} embedding dicts for {len(batch_texts)} texts.")
+                     print(f"Warning: Gemini API returned {len(response.embeddings)} embeddings for {len(batch_texts)} texts.")
                      # Fallback logic: Try to match based on order
-                     valid_embeddings = [emb['values'] for emb in response.embeddings if 'values' in emb]
+                     # *** CORRECTED LINE ***
+                     # Use attribute access and check existence with hasattr
+                     valid_embeddings = [emb.values for emb in response.embeddings if hasattr(emb, 'values')]
                      for idx in range(min(len(valid_embeddings), len(batch_texts))):
                          batch_embeddings_list[idx] = valid_embeddings[idx]
             else:
-                print(f"Warning: Gemini API returned no valid embeddings structure for batch starting at index {i}. Response: {response}")
+                # Handle cases where response.embeddings might be missing or not a list
+                error_detail = f"Response type: {type(response)}, Embeddings type: {type(response.embeddings) if hasattr(response, 'embeddings') else 'N/A'}"
+                print(f"Warning: Gemini API returned unexpected structure for batch starting at index {i}. {error_detail}. Response: {response}")
 
 
         except Exception as e:
-            print(f"Error creating batch embeddings (batch starting index {i}): {e}. Using default embeddings for this batch.")
+            # Catch the specific error if possible, otherwise general Exception
+            print(f"Error creating batch embeddings (batch starting index {i}): {type(e).__name__}: {e}. Using default embeddings for this batch.")
             # batch_embeddings_list remains filled with default error embeddings
 
         all_embeddings.extend(batch_embeddings_list)
@@ -193,7 +196,12 @@ def create_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> List[f
     try:
         # Batch size of 1 is handled by create_embeddings_batch
         embeddings = create_embeddings_batch([text], task_type=task_type, batch_size=1)
-        return embeddings[0] if embeddings else [0.0] * OUTPUT_DIMENSIONALITY
+        # Add a check here to ensure embeddings list is not empty before accessing index 0
+        if embeddings and len(embeddings) > 0:
+            return embeddings[0]
+        else:
+            print(f"Error: create_embeddings_batch returned empty list for single text embedding.")
+            return [0.0] * OUTPUT_DIMENSIONALITY
     except Exception as e:
         print(f"Error creating single embedding: {e}")
         return [0.0] * OUTPUT_DIMENSIONALITY
@@ -268,6 +276,12 @@ def add_documents_to_supabase(
 
         batch_data = []
         for j in range(len(batch_contents)):
+            # Check if the specific embedding for this chunk is valid (not all zeros)
+            # This check prevents inserting rows if embedding failed for that specific text
+            if not batch_embeddings[j] or all(v == 0.0 for v in batch_embeddings[j]):
+                print(f"Warning: Skipping chunk {j} in batch {i} (URL: {batch_urls[j]}, Chunk: {batch_chunk_numbers[j]}) due to failed embedding (all zeros).")
+                continue # Skip this specific chunk
+
             # Prepare data for insertion
             # Ensure metadata is serializable JSON
             current_metadata = batch_metadatas[j]
@@ -303,7 +317,7 @@ def add_documents_to_supabase(
                      print(f"Inserted batch {i//batch_size + 1} (response format unclear). Total inserted approx: {inserted_count}")
 
             else:
-                 print(f"Skipping insertion for batch {i//batch_size + 1} as no data was prepared (likely due to embedding errors).")
+                 print(f"Skipping insertion for batch {i//batch_size + 1} as no valid data was prepared (likely due to embedding errors).")
 
         except Exception as e:
             print(f"Error inserting batch {i//batch_size + 1} into Supabase: {e}")
@@ -335,8 +349,9 @@ def search_documents(
         print(f"Creating Gemini embedding for query (task: RETRIEVAL_QUERY, model: {GEMINI_EMBEDDING_MODEL}): '{query[:100]}...'")
         query_embedding = create_embedding(query, task_type="RETRIEVAL_QUERY")
 
-        if not query_embedding or query_embedding == [0.0] * OUTPUT_DIMENSIONALITY:
-             print("Error: Failed to generate embedding for the query.")
+        # Check if the embedding failed (returned all zeros)
+        if not query_embedding or all(v == 0.0 for v in query_embedding):
+             print("Error: Failed to generate embedding for the query (resulted in zero vector).")
              return []
 
         # Prepare parameters for the RPC call
